@@ -1004,6 +1004,8 @@ def main() -> None:
         subunits = _json("subunits.json")
         for sub in subunits.values():
             sub["outside"] = {k: set(v) for k, v in sub["outside"].items()}
+            sub["exec"] = {k: set(v) for k, v in sub.get("exec", {}).items()}
+        base_fps = _json("tpcfp.json")
         for plan in plans:
             commit, nums, patched = plan[0], plan[1], plan[2]
             if not patched:
@@ -1024,6 +1026,29 @@ def main() -> None:
                     log(f"{commit}: {tid.split('::')[-1]} runs no changed line in any query; dropped")
                     nums = plan[1]
                     continue
+                name = tid.split("::")[-1]
+                # Cheap check first: if the patch leaves the executor's own code alone
+                # and every query still parses, optimizes, plans and transpiles to the
+                # same thing, the executor sees identical input: the test cannot change.
+                exec_hit = any(p.startswith(("sqlglot/executor/", "tests/")) for p in patched) or any(
+                    ln in sub["exec"].get(path, ())
+                    for path, a, b in plan[5]
+                    for ln in range(a, b + 1)
+                )
+                if not exec_hit and name in base_fps and time_left():
+                    t0 = time.monotonic()
+                    fps = runner.tpc_fingerprint_check(str(SRC), patched, name, indices, timeout=30)
+                    spent += time.monotonic() - t0
+                    if fps is not None and len(fps) == len(indices):
+                        changed = [i for i, h in zip(indices, fps) if h != base_fps[name][i]]
+                        log(f"{commit}: {name} fingerprints of {len(indices)} queries in "
+                            f"{time.monotonic() - t0:.2f}s: {len(changed)} changed")
+                        if not changed:
+                            plan[1] = set(nums) - {n}
+                            nums = plan[1]
+                            continue
+                        indices = changed
+                        est_ms = 900 + sum(qms[i] for i in indices)
                 if est_ms + 1000 >= save_ms or spent + est_ms / 1000 > VERIFY_BUDGET_S or not time_left():
                     continue
                 t0 = time.monotonic()

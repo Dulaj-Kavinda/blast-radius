@@ -41,7 +41,7 @@ def main() -> None:
         kind, _, node = ctx.partition("|")
         if kind == "c":
             return by_module.get(node, 0)
-        if kind == "q":
+        if kind in ("q", "x"):
             base = node.rsplit("|", 1)[0]
             return 1 << index[base] if base in index else 0
         if node not in index:
@@ -62,6 +62,7 @@ def main() -> None:
     sub_outside: dict = defaultdict(lambda: defaultdict(set))
     sub_count: dict = defaultdict(int)
     shared_outside: dict = defaultdict(set)
+    sub_exec: dict = defaultdict(lambda: defaultdict(set))
     own_outside: dict = defaultdict(lambda: defaultdict(set))
 
     files_mask: dict[str, int] = {}
@@ -73,8 +74,10 @@ def main() -> None:
             mask = 0
             for c in ctxs:
                 mask |= expand(c)
-                if c.startswith("q|"):
+                if c.startswith("q|") or c.startswith("x|"):
                     base, q = c[2:].rsplit("|", 1)
+                    if c.startswith("x|"):
+                        sub_exec[base][rel].add(lineno)
                     sub_lines[base][rel][lineno] = sub_lines[base][rel].get(lineno, 0) | (1 << int(q))
                     sub_count[base] = max(sub_count[base], int(q) + 1)
             for c in ctxs:
@@ -134,6 +137,7 @@ def main() -> None:
             ],
             "lines": {f: {str(k): format(v, "x") for k, v in sorted(m.items())} for f, m in sub_lines[base].items()},
             "outside": {f: sorted(v) for f, v in sub_outside[base].items()},
+            "exec": {f: sorted(v) for f, v in sub_exec[base].items()},
         }
         for base in sub_count
     }

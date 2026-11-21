@@ -3,8 +3,9 @@
 For each patch to sqlglot (pinned at `eb11aec`), this picks the tests that can
 fail and splits them over workers at the lowest cost. Nothing is run at score
 time except a few cheap checks that pay for themselves (below). On the 30
-sample commits: 158.3 s simulated, 0 misses, about 3.5 s of CPU. On 66
-synthetic commits checked against real test runs: 0 misses.
+sample commits: 141.5 s simulated, 0 misses, about 7 s of CPU. On 66
+synthetic commits checked against real test runs: 0 misses. First practice
+submission (before the TPC fingerprints): 199.6 s simulated + 8.0 s CPU = 207.6 s.
 
 ## How it decides
 
@@ -68,6 +69,15 @@ pools are replaced by an in-process executor that still pickles.
    was selected only because it runs the changed lines, and the replay is
    cheap enough, only the queries that execute those lines are replayed. If
    they all pass, the test is dropped.
+
+4. **TPC fingerprints.** Before replaying, the child fingerprints each affected
+   query: the parsed and pickled expression, the tables it reads, the optimized
+   expression, the full plan, and the DuckDB SQL the expected result comes
+   from. This takes about 1.3 s for all 57 executed TPC-DS queries. If the
+   patch does not touch code that runs during execution (recorded per query in
+   the map) and no fingerprint changed, the executor gets identical input and
+   the test is dropped without running anything. Otherwise, only the queries
+   whose fingerprints changed are replayed.
 
 A deadline (110 s) and a budget keep the batch well inside the 3-minute limit.
 

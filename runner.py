@@ -351,3 +351,112 @@ def verify(root: str, files: dict[str, str], test_ids: list[str], timeout: float
         if out.get(tid) != "fail":
             out[tid] = verdict
     return out
+
+
+# --------------------------------------------------------------- TPC fingerprints
+
+
+def _canon(v, steps):
+    """A deterministic, JSON-able view of planner objects and expressions."""
+    from sqlglot import exp
+    from sqlglot.planner import Step
+    from sqlglot.serde import dump
+
+    if isinstance(v, exp.Expr):
+        return ["E", dump(v)]
+    if isinstance(v, Step):
+        if id(v) not in steps:
+            steps[id(v)] = None  # placeholder against cycles
+            fields = [[k, _canon(x, steps)] for k, x in sorted(vars(v).items()) if k not in ("dependencies", "dependents")]
+            for d in v.dependencies:
+                _canon(d, steps)
+            steps[id(v)] = [type(v).__name__, fields, sorted(d.name for d in v.dependencies)]
+        return ["S", v.name]
+    if isinstance(v, dict):
+        return ["D", sorted([[_canon(k, steps), _canon(x, steps)] for k, x in v.items()], key=repr)]
+    if isinstance(v, (set, frozenset)):
+        return ["T", sorted((_canon(x, steps) for x in v), key=repr)]
+    if isinstance(v, (list, tuple)):
+        return ["L", [_canon(x, steps) for x in v]]
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    return ["O", type(v).__name__, repr(v)]
+
+
+def tpc_fingerprints(test_name: str, indices=None) -> list[str]:
+    """Per-query fingerprint of everything the TPC executor test derives from
+    sqlglot before running on data: the parsed (and pickled) expression, the
+    tables it reads, the optimized expression, the plan, and the duckdb SQL
+    the expected result comes from. Must run inside a process where the
+    module overlay (if any) is installed."""
+    import hashlib
+    import pickle
+
+    from sqlglot import parse_one, transpile
+    from sqlglot.executor import Plan, optimize
+    from sqlglot.schema import ensure_schema
+
+    mod = importlib.import_module("tests.test_executor")
+    helpers = importlib.import_module("tests.helpers")
+    tpch = test_name == "test_execute_tpch"
+    path = "optimizer/tpc-h/tpc-h.sql" if tpch else "optimizer/tpc-ds/tpc-ds.sql"
+    sqls = list(helpers.load_sql_fixture_pairs(path))
+    schema_dict = mod.TPCH_SCHEMA if tpch else mod.TPCDS_SCHEMA
+    out = []
+    for i in range(len(sqls)) if indices is None else indices:
+        args, sql, _ = sqls[i]
+        try:
+            expr = pickle.loads(pickle.dumps(parse_one(sql)))
+            parts = [_canon(expr, {})]
+            if args.get("execute"):
+                parts.append(sorted(t.name for t in mod.find_tables(expr)))
+                optimized = optimize(expr, ensure_schema(schema_dict), leave_tables_isolated=True)
+                parts.append(_canon(optimized, {}))
+                steps: dict = {}
+                plan = Plan(optimized)
+                parts.append(_canon(plan.root, steps))
+                parts.append(sorted((s for s in steps.values() if s is not None), key=repr))
+                parts.append(transpile(sql, write="duckdb")[0])
+            blob = json.dumps(parts, sort_keys=True, default=repr)
+        except BaseException as e:  # noqa: BLE001
+            blob = f"error {type(e).__name__}: {e}"
+        out.append(hashlib.sha256(blob.encode()).hexdigest()[:16])
+    return out
+
+
+def _fp_child(root, files, test_name, indices, wfd):
+    import concurrent.futures
+
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.environ["SKIP_INTEGRATION"] = "0"
+    os.chdir(root)
+    sys.path.insert(0, root)
+    sys.dont_write_bytecode = True
+    concurrent.futures.ProcessPoolExecutor = _InlineExecutor
+    sys.meta_path.insert(0, _Overlay(root, files))
+    try:
+        out = tpc_fingerprints(test_name, indices)
+    except BaseException:  # noqa: BLE001
+        out = None
+    os.write(wfd, (json.dumps(out) + "\n").encode())
+    os._exit(0)
+
+
+def tpc_fingerprint_check(root: str, files: dict[str, str], test_name: str, indices: list[int], timeout: float):
+    """Fingerprints of the given queries with files overlaid, or None."""
+    rfd, wfd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(rfd)
+        try:
+            _fp_child(root, files, test_name, indices, wfd)
+        finally:
+            os._exit(1)
+    os.close(wfd)
+    buf = _read_until(rfd, pid, timeout)
+    try:
+        return json.loads(buf.decode().strip().split("\n")[-1])
+    except (ValueError, IndexError):
+        return None

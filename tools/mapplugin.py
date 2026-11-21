@@ -223,6 +223,7 @@ def _per_query_mp_execute(self, schema, tables, sqls, tpch):
     for i, table in enumerate(tables_out):
         _switch(f"q|{tid}|{i}")
         _clear_caches()
+        self.cache.pop(sqls[i][1], None)  # duckdb SQL is transpiled inside this query's context
         t0 = time.process_time()
         if table is not None:
             self.subtestHelper(i, table, tpch=tpch)
@@ -234,10 +235,31 @@ def _per_query_mp_execute(self, schema, tables, sqls, tpch):
 _query_times: dict = {}
 
 
+def _exec_phase(fn):
+    """Run fn under x|<test>|<query> while inside a per-query context: the
+    executor's data processing, which TPC fingerprints do not cover."""
+
+    def wrapper(*a, **k):
+        prev = _ctx
+        if prev.startswith("q|"):
+            _switch("x|" + prev[2:])
+        try:
+            return fn(*a, **k)
+        finally:
+            if prev.startswith("q|"):
+                _switch(prev)
+
+    return wrapper
+
+
 def pytest_collection_modifyitems(session, config, items):
     mod = sys.modules.get("tests.test_executor")
     if mod is not None and hasattr(mod, "TestExecutor"):
         mod.TestExecutor._mp_execute = _per_query_mp_execute
+        ex = sys.modules["sqlglot.executor"]
+        py = sys.modules["sqlglot.executor.python"]
+        py.PythonExecutor.execute = _exec_phase(py.PythonExecutor.execute)
+        ex.ensure_tables = _exec_phase(ex.ensure_tables)
 
 
 @pytest.hookimpl(hookwrapper=True)
