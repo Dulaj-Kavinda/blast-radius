@@ -24,6 +24,23 @@ import sys
 import time
 
 
+def bench_ms(rounds: int = 5) -> float:
+    """CPU ms of a fixed pure-Python workload (dicts, strings, calls: like
+    sqlglot's), best of `rounds`. Compared with the same number measured when
+    the map was built, it calibrates per-test CPU costs to this machine."""
+    best = float("inf")
+    for _ in range(rounds):
+        t0 = time.process_time()
+        d: dict = {}
+        acc = 0
+        for i in range(40000):
+            k = "k" + str(i % 997)
+            d[k] = d.get(k, 0) + i
+            acc += len(k.upper()) if i % 3 else hash(k) & 7
+        best = min(best, (time.process_time() - t0) * 1000)
+    return best
+
+
 def _debug(what: str) -> None:
     """BR_RUNNER_DEBUG=<file>: append child tracebacks there (local debugging)."""
     path = os.environ.get("BR_RUNNER_DEBUG")
@@ -127,7 +144,7 @@ class _InlineExecutor:
         return False
 
 
-def _child(root: str, files: dict[str, str], test_ids: list[str], wfd: int) -> None:
+def _child(root: str, files: dict[str, str], test_ids: list[str], wfd: int, max_failures: int = 1) -> None:
     import concurrent.futures
     import unittest
 
@@ -164,7 +181,8 @@ def _child(root: str, files: dict[str, str], test_ids: list[str], wfd: int) -> N
                 return
             if not ok:
                 put(tid, "fail")
-                self.stop()
+                if sum(1 for v in results.values() if v == "fail") >= max_failures:
+                    self.stop()
             else:
                 put(tid, "pass")
 
@@ -346,7 +364,9 @@ def _read_until(rfd: int, pid: int, timeout: float) -> bytes:
     return buf
 
 
-def verify(root: str, files: dict[str, str], test_ids: list[str], timeout: float) -> dict[str, str]:
+def verify(
+    root: str, files: dict[str, str], test_ids: list[str], timeout: float, max_failures: int = 1
+) -> dict[str, str]:
     """Run test_ids against root with files overlaid. Returns {id: pass|fail}."""
     if not test_ids:
         return {}
@@ -355,7 +375,7 @@ def verify(root: str, files: dict[str, str], test_ids: list[str], timeout: float
     if pid == 0:
         os.close(rfd)
         try:
-            _child(root, files, test_ids, wfd)
+            _child(root, files, test_ids, wfd, max_failures)
         finally:
             os._exit(1)
     os.close(wfd)
@@ -517,7 +537,29 @@ def _replica_max_nodes():
     return out
 
 
-REPLICAS = {"tests/test_parser.py::TestParser::test_max_nodes": _replica_max_nodes}
+def _exact_optimized_tpch():
+    """tests/test_executor.py::TestExecutor::test_optimized_tpch compares duckdb
+    results of each TPC-H query and its expected optimized form; sqlglot's only
+    part is transpiling both to duckdb. Same SQL text in, same frames out."""
+    from sqlglot import transpile
+
+    helpers = importlib.import_module("tests.helpers")
+    out = []
+    for _, sql, optimized in helpers.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"):
+        row = []
+        for text in (sql, optimized):
+            try:
+                row.append(transpile(text, write="duckdb")[0])
+            except Exception as e:  # noqa: BLE001
+                row.append(f"error {type(e).__name__}: {e}")
+        out.append(row)
+    return out
+
+
+REPLICAS = {
+    "tests/test_parser.py::TestParser::test_max_nodes": _replica_max_nodes,
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch": _exact_optimized_tpch,
+}
 
 
 def replica_fingerprint(test_id: str) -> str:
@@ -531,6 +573,7 @@ def _replica_child(root, files, test_id, wfd):
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
+    os.environ["SKIP_INTEGRATION"] = "0"
     root = os.path.abspath(root)
     os.chdir(root)
     sys.path.insert(0, root)

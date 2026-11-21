@@ -25,3 +25,4 @@ fp = {t: runner.tpc_fingerprints(t) for t in ('test_execute_tpcds', 'test_execut
 fp['replicas'] = {t: runner.replica_fingerprint(t) for t in runner.REPLICAS}
 json.dump(fp, open('$HERE/map/tpcfp.json', 'w'))
 " 2>/dev/null)
+"$WORK/venv/bin/python" tools/measure_cpu.py "$SQ" "$TESTS_JSON" map/cpu.json 2

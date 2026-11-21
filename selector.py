@@ -285,6 +285,64 @@ class Change:
         self.insert_after: set[int] = set()  # new lines inserted after this old line (0 = top)
 
 
+_SWAPS = {("is",): ("==",), ("==",): ("is",), ("is", "not"): ("!=",), ("!=",): ("is", "not")}
+
+
+def _line_tokens(line: str):
+    try:
+        return [t.string for t in tokenize.generate_tokens(io.StringIO(line.strip() + "\n").readline)
+                if t.type not in (tokenize.NEWLINE, tokenize.NL, tokenize.COMMENT, tokenize.ENDMARKER,
+                                  tokenize.INDENT, tokenize.DEDENT)]
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return None
+
+
+def _identity_swap(old: str, new: str) -> bool:
+    """old -> new only swaps `is`/`==` (or `is not`/`!=`) in a comparison with
+    None or an enum member (Name.UPPER_CASE). For None every sqlglot __eq__ answers
+    False, for enum members identity and equality agree: such edits are refactors."""
+    a, b = _line_tokens(old), _line_tokens(new)
+    if not a or not b or _indent(old) != _indent(new):
+        return False
+    i = 0
+    while i < min(len(a), len(b)) and a[i] == b[i]:
+        i += 1
+    j = 0
+    while j < min(len(a), len(b)) - i and a[-1 - j] == b[-1 - j]:
+        j += 1
+    seg_a, seg_b = tuple(a[i : len(a) - j]), tuple(b[i : len(b) - j])
+    if _SWAPS.get(seg_a) != seg_b:
+        return False
+    rest = a[len(a) - j :]
+    if rest[:1] == ["None"]:
+        return True
+    return (
+        len(rest) >= 3 and rest[1] == "." and rest[0][:1].isupper() and rest[2].isupper() and len(rest[2]) > 1
+        and (len(rest) == 3 or rest[3] in (")", ":", ",", "and", "or", "else", "]"))
+    )
+
+
+def identity_swap_only(hunks) -> bool:
+    pairs = 0
+    for _, body in hunks:
+        i = 0
+        while i < len(body):
+            if body[i][:1] == " ":
+                i += 1
+                continue
+            minus, plus = [], []
+            while i < len(body) and body[i][:1] == "-":
+                minus.append(body[i][1:])
+                i += 1
+            while i < len(body) and body[i][:1] == "+":
+                plus.append(body[i][1:])
+                i += 1
+            if len(minus) != len(plus) or not all(_identity_swap(a, b) for a, b in zip(minus, plus)):
+                return False
+            pairs += len(minus)
+    return pairs > 0
+
+
 def hunk_changes(hunks) -> Change:
     ch = Change()
     for old_start, body in hunks:
@@ -517,6 +575,11 @@ class Analyzer:
         self.direct = 0  # tests that ran a changed line itself
         self.verifiable = True  # False: something a test reads cannot be overlaid
         self.import_risk = False  # a changed line runs while modules import
+        self.equiv = True  # every change so far is a comment or an is/== refactor
+        self.blocked = 0  # tests that read a changed data / source file: cannot be checked here
+        self.nonline_cls = 0  # tests selected only as users of a changed class attribute
+        self.changed_classes: set[str] = set()
+        self.cls_impure = False  # a class change also reached module-level names
         self.spans: list[tuple[str, int, int]] = []  # line ranges whose coverage selected tests
         self.nonline = 0  # tests selected for any other reason (class users, imports, data...)
         self._path = ""
@@ -611,8 +674,7 @@ class Analyzer:
         old = old_path.read_text(encoding="utf-8")
         new = apply_hunks(old, fd.hunks)
         mask = self._nl(opens_mask(path))  # tests that read this source as text
-        if mask:
-            self.verifiable = False
+        self.blocked |= mask
         if same_tokens(old, new):
             return mask
         try:
@@ -621,6 +683,8 @@ class Analyzer:
             self.verifiable = False
             return mask | self._nl(self.module_users(mod))
         self.patched[path] = new
+        if not identity_swap_only(fd.hunks):
+            self.equiv = False
         om = Module(old)
         lm = line_map(path)
         ch = hunk_changes(fd.hunks)
@@ -647,7 +711,7 @@ class Analyzer:
             if is_test:
                 m |= self._nl(self.test_func_owner(path, om, f))
             return m
-        return self._nl(self.import_statement(path, mod, om, lm, ln, is_test))
+        return self.import_statement(path, mod, om, lm, ln, is_test)
 
     def _nl(self, m: int) -> int:
         self.nonline |= m
@@ -704,23 +768,26 @@ class Analyzer:
             return 0  # docstring
         c = om.class_at(ln)
         if is_test:
-            return self.test_import_statement(path, mod, om, st, c)
+            return self._nl(self.test_import_statement(path, mod, om, st, c))
         if isinstance(st, (ast.Import, ast.ImportFrom)):
-            return self.module_users(mod) | names_mask(defined_names(st))
+            return self._nl(self.module_users(mod) | names_mask(defined_names(st)))
         names = defined_names(st)
         m = self.span_mask(lm, span[0], span[1])
         if c is not None:
             cq = c[3]
             const = isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and bool(names)
-            m |= self.class_attr_effect(mod, cq, names, const, set())
-        else:
-            if not names:
-                # a bare call / if-block at module level: anything importing it
-                return m | self.module_users(mod)
-            m |= self.name_users(names, set())
-            if isinstance(st, ast.ClassDef):
-                m |= class_mask(f"{mod}:{st.name}")
-        return m
+            seen: set = set()
+            cm = self.class_attr_effect(mod, cq, names, const, seen)
+            self.changed_classes.update(f"{k[0]}:{k[1]}" for k in seen)
+            self.nonline_cls |= cm
+            return m | cm
+        if not names:
+            # a bare call / if-block at module level: anything importing it
+            return self._nl(m | self.module_users(mod))
+        m |= self.name_users(names, set())
+        if isinstance(st, ast.ClassDef):
+            m |= class_mask(f"{mod}:{st.name}")
+        return self._nl(m)
 
     def class_attr_effect(self, mod: str, cq: str, names: set[str], const: bool, seen: set) -> int:
         """Tests affected when class attributes `names` of class cq change.
@@ -760,6 +827,7 @@ class Analyzer:
                 if ecq:
                     m |= self.class_attr_effect(emod, ecq, set(dnames), bool(dnames), seen)
                 else:
+                    self.cls_impure = True
                     m |= self.name_users(set(dnames), set())
         return m
 
@@ -772,6 +840,8 @@ class Analyzer:
 
     # any file -----------------------------------------------------------------
     def file_effect(self, fd: FileDiff) -> int:
+        if not (fd.path.endswith(".py") and fd.path.startswith("sqlglot/")) or fd.new_file or fd.deleted:
+            self.equiv = False
         m = self._file_effect(fd)
         if not (fd.path.endswith(".py") and (fd.path.startswith("sqlglot/") or fd.path.startswith("tests/"))):
             self.nonline |= m
@@ -802,8 +872,7 @@ class Analyzer:
         m = opens_mask(path)
         if m and path.endswith(".sql") and not fd.binary and _sql_comment_only(fd):
             return 0
-        if m:
-            self.verifiable = False  # a data file the tests read: cannot overlay it
+        self.blocked |= m  # a data file the tests read: cannot overlay it
         if fd.deleted and m:
             return m
         return m
@@ -877,9 +946,12 @@ def cost_ms(nums, ms) -> int:
 
 
 # Tests whose outcome a forked, in-memory run cannot reproduce faithfully.
-UNVERIFIABLE_RE = re.compile(r"::test_lazy_load$|^tests/test_sqlglotc\.py|::test_generator_memory$")
-VERIFY_MAX_TEST_MS = int(os.environ.get("BR_VERIFY_MAX_TEST_MS", "4000"))
-VERIFY_OVERHEAD_MS = 250  # fork + fresh sqlglot / test imports, measured ~100-200 ms
+UNVERIFIABLE_RE = re.compile(r"::test_lazy_load$|^tests/test_sqlglotc\.py")
+# scoring-machine CPU / this machine's CPU, for the measured per-test costs in map/cpu.json
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "2.0"))
+EQUIV_HOLD_MS = 1000
+VERIFY_MAX_FAILURES = int(os.environ.get("BR_VERIFY_MAX_FAILURES", "25"))
+VERIFY_OVERHEAD_MS = 60  # fork + fresh sqlglot import, measured 20-50 ms
 VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET_S", "75"))
 # Never let checks push the whole batch near the run limit (3 min, 4.5 in the final).
 DEADLINE_S = float(os.environ.get("BR_DEADLINE_S", "110"))
@@ -929,7 +1001,17 @@ def main() -> None:
             nums.update(unmapped)
         patched = dict(an.patched) if an.verifiable and an.patched else None
         risky = dict(an.patched) if an.import_risk and an.patched else None
-        plans.append([commit, nums, patched, to_numbers(an.direct), risky, list(an.spans), to_numbers(an.nonline)])
+        held = set()
+        if an.equiv and patched and nums and not an.blocked:
+            # is/== refactor only: hold back the expensive tests, run the cheap ones;
+            # the held tests come back if any cheap one fails or does not run
+            held = {n for n in nums if ms[n] > EQUIV_HOLD_MS}
+            nums = nums - held
+            log(f"{commit}: is/== refactor; holding {len(held)} expensive tests until the cheap ones pass")
+        plans.append([commit, nums, patched, to_numbers(an.direct), risky, list(an.spans), to_numbers(an.nonline),
+                      held, False, to_numbers(an.blocked),
+                      (to_numbers(an.nonline_cls) - to_numbers(an.nonline), set(an.changed_classes), an.cls_impure),
+                      False])
 
     # Run-time verification: for commits where running the cheap selected tests
     # is expected to cost less than listing them, run them and drop the ones
@@ -941,148 +1023,229 @@ def main() -> None:
         import runner as _runner
 
         runner = _runner if _runner.preload() else None
-        verify_on = runner is not None
+    verify_on = verify_on and runner is not None
 
-    # Import check: a changed line that runs while modules import can raise
-    # there, and then every test importing that module fails. Importing every
-    # sqlglot and test module with the patch applied tells exactly which break.
-    risky_plans = [p for p in plans if p[4]]
-    if risky_plans:
-        base = runner.import_check(str(SRC), {}) if runner else None
-        for plan in risky_plans:
-            failed = (
-                runner.import_check(str(SRC), plan[4]) if runner and base is not None and time_left() else None
-            )
-            if failed is None:
-                log(f"{plan[0]}: import check unavailable; selecting importers of the changed modules")
+    try:
+        # Import check: a changed line that runs while modules import can raise
+        # there, and then every test importing that module fails. Importing every
+        # sqlglot and test module with the patch applied tells exactly which break.
+        risky_plans = [p for p in plans if p[4]]
+        if risky_plans:
+            base = runner.import_check(str(SRC), {}) if runner else None
+            for plan in risky_plans:
+                failed = (
+                    runner.import_check(str(SRC), plan[4]) if runner and base is not None and time_left() else None
+                )
+                if failed is None:
+                    log(f"{plan[0]}: import check unavailable; selecting importers of the changed modules")
+                    extra = 0
+                    for path in plan[4]:
+                        extra |= an.module_users(module_name(path))
+                else:
+                    new = [m for m in failed if m not in base]
+                    extra = 0
+                    for m in new:
+                        extra |= an.module_users(m)
+                    if new:
+                        log(f"{plan[0]}: import fails for {new[:5]}{'...' if len(new) > 5 else ''}")
+                        plan[2] = None  # most tests fail anyway: nothing to gain from verifying
+                plan[1] = set(plan[1]) | to_numbers(extra)
+                plan[6] = set(plan[6]) | to_numbers(extra)
+                plan[11] = True
+
+        if verify_on:
+            # Run selected tests whose real in-process CPU (measured at map build,
+            # scaled to the scoring machine) is below what listing them costs, and
+            # keep only the ones that fail. Most tests run far below their recorded
+            # seconds: those include pytest and process-pool start-up.
+            cpu = _json("cpu.json")
+            global CPU_FACTOR
+            if "BR_CPU_FACTOR" not in os.environ and cpu.get("bench_ms"):
+                # this machine vs the one the map was measured on, with 15% headroom
+                CPU_FACTOR = min(max(1.05 * runner.bench_ms() / cpu["bench_ms"], 0.8), 5.0)
+                log(f"cpu factor {CPU_FACTOR:.2f}")
+            cpu_t, cpu_setup, cpu_imp = cpu.get("tests", {}), cpu.get("setup", {}), cpu.get("import", {})
+            cpu_warm = cpu.get("warmup", {})
+            untrusted = set(cpu.get("baseline_fail", []))
+            own_checks = set(_json("subunits.json")) | set(_json("tpcfp.json").get("replicas", {}))
+
+            def pred_ms(n):
+                c = cpu_t.get(id_of[n])
+                return CPU_FACTOR * c if c is not None else ms[n]
+
+            def run_cost(sel):
+                files, classes = set(), set()
+                total = VERIFY_OVERHEAD_MS
+                for n in sel:
+                    parts = id_of[n].split("::")
+                    files.add(parts[0])
+                    classes.add("::".join(parts[:2]))
+                    total += pred_ms(n)
+                total += CPU_FACTOR * sum(cpu_setup.get(c, 0) + 0 for c in classes)
+                total += CPU_FACTOR * sum(cpu_imp.get(f, 50) + cpu_warm.get(f, 0) for f in files)
+                return total
+
+            candidates = []
+            for plan in plans:
+                commit, nums, patched, direct = plan[:4]
+                if not patched or not nums:
+                    continue
+                runnable = [
+                    n for n in nums
+                    if not UNVERIFIABLE_RE.search(id_of[n]) and id_of[n] not in untrusted and id_of[n] not in own_checks
+                    and n not in plan[9]
+                ]
+                if not runnable:
+                    continue
+                base_cost = cost_ms(nums, ms)
+                best = None
+                for r in (0.0, 1.0, 2.0, 4.0, 10.0):
+                    sel = [n for n in runnable if ms[n] >= r * pred_ms(n)]
+                    if not sel or (best and len(sel) == len(best[2])):
+                        continue
+                    rc = run_cost(sel)
+                    gain = base_cost - cost_ms(set(nums) - set(sel), ms) - rc
+                    if best is None or gain > best[0]:
+                        best = (gain, rc, sel)
+                if plan[7] and best:
+                    best = (best[0] + cost_ms(set(nums) | plan[7], ms), best[1], runnable)  # must run them all
+                if best and best[0] > 200:
+                    # likeliest failures first: tests that ran the changed lines, cheapest first
+                    order = sorted(best[2], key=lambda n: (n not in direct, pred_ms(n)))
+                    # keep each class together: unittest re-runs setUpClass whenever the class changes
+                    rank = {}
+                    for n in order:
+                        rank.setdefault("::".join(id_of[n].split("::")[:2]), len(rank))
+                    order.sort(key=lambda n: rank["::".join(id_of[n].split("::")[:2])])
+                    candidates.append((best[0], plan, order, best[1]))
+            spent = 0.0
+            for gain, plan, order, run_ms in sorted(candidates, key=lambda c: -c[0]) if verify_on else []:
+                if spent + run_ms / 1000 > VERIFY_BUDGET_S or not time_left():
+                    continue
+                t0 = time.monotonic()
+                res = runner.verify(
+                    str(SRC), plan[2], [id_of[n] for n in order], timeout=3 * run_ms / 1000 + 5,
+                    max_failures=VERIFY_MAX_FAILURES,
+                )
+                spent += time.monotonic() - t0
+                passed = {by_id[t] for t, v in res.items() if v == "pass"}
+                failed = [t for t, v in res.items() if v == "fail"]
+                plan[1] = set(plan[1]) - passed
+                if plan[7]:
+                    ran_all = all(res.get(id_of[n]) == "pass" for n in order)
+                    if not ran_all:
+                        plan[1] |= plan[7]
+                    plan[7] = set() if not ran_all else plan[7]
+                    plan[8] = ran_all
+                log(f"{plan[0]}: verified {len(res)}/{len(order)} tests in {time.monotonic() - t0:.2f}s "
+                    f"(predicted {run_ms / 1000:.2f}s), {len(failed)} failing, {len(passed)} dropped")
+            log(f"verification wall time {spent:.1f}s")
+
+            # Scaled-down replicas of single huge tests (test_max_nodes, 28.8 s): if the
+            # patched code gives the replica the same tokens, trees and errors as the
+            # pinned code, the full-size test behaves the same.
+            replica_fps = _json("tpcfp.json").get("replicas", {}) if runner else {}
+            for plan in plans if runner else []:
+                commit, nums, patched = plan[0], plan[1], plan[2]
+                if not patched or any(p.startswith("tests/") for p in patched):
+                    continue
+                for tid, base in replica_fps.items():
+                    n = by_id.get(tid)
+                    if n is None or n not in nums or n in plan[9] or not time_left():
+                        continue
+                    if cost_ms(nums, ms) - cost_ms(set(nums) - {n}, ms) < 1500:
+                        continue
+                    t0 = time.monotonic()
+                    fp = runner.replica_check(str(SRC), patched, tid, timeout=20)
+                    log(f"{commit}: {tid.split('::')[-1]} replica in {time.monotonic() - t0:.2f}s: "
+                        f"{'same' if fp == base else 'changed' if fp else 'unavailable'}")
+                    if fp == base:
+                        plan[1] = set(nums) - {n}
+                        nums = plan[1]
+
+            # Split TPC tests: replay only the queries that run a changed line.
+            subunits = _json("subunits.json")
+            for sub in subunits.values():
+                sub["outside"] = {k: set(v) for k, v in sub["outside"].items()}
+                sub["exec"] = {k: set(v) for k, v in sub.get("exec", {}).items()}
+            base_fps = _json("tpcfp.json")
+            for plan in plans:
+                commit, nums, patched = plan[0], plan[1], plan[2]
+                if not patched:
+                    continue
+                for tid, sub in subunits.items():
+                    n = by_id.get(tid)
+                    if n is None or n not in nums or n in plan[6] or n in plan[9]:
+                        continue
+                    q = _queries_for(sub, plan[5])
+                    if q is None:
+                        continue  # a changed line runs outside the queries (setup, pool, import)
+                    cls_only, changed_classes, impure = plan[10]
+                    if n in cls_only:
+                        # selected as a user of a changed class attribute: every query may see
+                        # it, but if the executor itself never instantiates the class, the
+                        # fingerprints still cover all that can change
+                        if impure or changed_classes & set(sub.get("exec_classes", ())):
+                            continue
+                        q = (1 << sub["queries"]) - 1
+                    indices = [i for i in range(sub["queries"]) if q >> i & 1]
+                    qms = sub.get("ms") or [ms[n] // max(sub["queries"], 1)] * sub["queries"]
+                    est_ms = 900 + sum(qms[i] for i in indices)
+                    save_ms = cost_ms(nums, ms) - cost_ms(set(nums) - {n}, ms)
+                    if not indices:
+                        plan[1] = set(nums) - {n}
+                        log(f"{commit}: {tid.split('::')[-1]} runs no changed line in any query; dropped")
+                        nums = plan[1]
+                        continue
+                    name = tid.split("::")[-1]
+                    # Cheap check first: if the patch leaves the executor's own code alone
+                    # and every query still parses, optimizes, plans and transpiles to the
+                    # same thing, the executor sees identical input: the test cannot change.
+                    exec_hit = any(p.startswith(("sqlglot/executor/", "tests/")) for p in patched) or any(
+                        ln in sub["exec"].get(path, ())
+                        for path, a, b in plan[5]
+                        for ln in range(a, b + 1)
+                    )
+                    if not exec_hit and name in base_fps and time_left():
+                        t0 = time.monotonic()
+                        fps = runner.tpc_fingerprint_check(str(SRC), patched, name, indices, timeout=30)
+                        spent += time.monotonic() - t0
+                        if fps is not None and len(fps) == len(indices):
+                            changed = [i for i, h in zip(indices, fps) if h != base_fps[name][i]]
+                            log(f"{commit}: {name} fingerprints of {len(indices)} queries in "
+                                f"{time.monotonic() - t0:.2f}s: {len(changed)} changed")
+                            if not changed:
+                                plan[1] = set(nums) - {n}
+                                nums = plan[1]
+                                continue
+                            indices = changed
+                            est_ms = 900 + sum(qms[i] for i in indices)
+                    if est_ms + 1000 >= save_ms or spent + est_ms / 1000 > VERIFY_BUDGET_S or not time_left():
+                        continue
+                    t0 = time.monotonic()
+                    verdict = runner.run_tpc_queries(
+                        str(SRC), patched, tid.split("::")[-1], indices, timeout=3 * est_ms / 1000 + 5
+                    )
+                    spent += time.monotonic() - t0
+                    log(f"{commit}: {tid.split('::')[-1]} replayed {len(indices)} queries in "
+                        f"{time.monotonic() - t0:.2f}s: {verdict}")
+                    if verdict == "pass":
+                        plan[1] = set(nums) - {n}
+                        nums = plan[1]
+
+    except Exception as e:  # a failed check must never fail the run
+        log(f"run-time checks stopped ({type(e).__name__}: {e}); keeping the static selection")
+        for plan in plans:
+            if plan[4] and not plan[11]:
                 extra = 0
                 for path in plan[4]:
                     extra |= an.module_users(module_name(path))
-            else:
-                new = [m for m in failed if m not in base]
-                extra = 0
-                for m in new:
-                    extra |= an.module_users(m)
-                if new:
-                    log(f"{plan[0]}: import fails for {new[:5]}{'...' if len(new) > 5 else ''}")
-                    plan[2] = None  # most tests fail anyway: nothing to gain from verifying
-            plan[1] = set(plan[1]) | to_numbers(extra)
-            plan[6] = set(plan[6]) | to_numbers(extra)
+                plan[1] = set(plan[1]) | to_numbers(extra)
 
-    if verify_on:
-        candidates = []
-        for plan in plans:
-            commit, nums, patched, direct = plan[:4]
-            if not patched or not nums:
-                continue
-            runnable = [n for n in nums if ms[n] <= VERIFY_MAX_TEST_MS and not UNVERIFIABLE_RE.search(id_of[n])]
-            if not runnable:
-                continue
-            run_ms = sum(ms[n] for n in runnable) + VERIFY_OVERHEAD_MS
-            if any(id_of[n].startswith("tests/test_executor.py::TestExecutor::") for n in runnable):
-                run_ms += 900  # setUpClass loads the TPC-H / TPC-DS tables
-            gain = cost_ms(nums, ms) - cost_ms(set(nums) - set(runnable), ms) - run_ms
-            if gain > 0:
-                # likeliest failures first: tests that ran the changed lines, cheapest first
-                order = sorted(runnable, key=lambda n: (n not in direct, ms[n]))
-                candidates.append((gain, plan, order, run_ms))
-        spent = 0.0
-        for gain, plan, order, run_ms in sorted(candidates, key=lambda c: -c[0]) if verify_on else []:
-            if spent + run_ms / 1000 > VERIFY_BUDGET_S or not time_left():
-                continue
-            t0 = time.monotonic()
-            res = runner.verify(str(SRC), plan[2], [id_of[n] for n in order], timeout=3 * run_ms / 1000 + 3)
-            spent += time.monotonic() - t0
-            passed = {by_id[t] for t, v in res.items() if v == "pass"}
-            failed = [t for t, v in res.items() if v == "fail"]
-            plan[1] = set(plan[1]) - passed
-            log(f"{plan[0]}: verified {len(res)}/{len(order)} tests in {time.monotonic() - t0:.2f}s, "
-                f"{len(failed)} failing, {len(passed)} dropped")
-        log(f"verification wall time {spent:.1f}s")
-
-        # Split TPC tests: replay only the queries that run a changed line.
-        subunits = _json("subunits.json")
-        for sub in subunits.values():
-            sub["outside"] = {k: set(v) for k, v in sub["outside"].items()}
-            sub["exec"] = {k: set(v) for k, v in sub.get("exec", {}).items()}
-        base_fps = _json("tpcfp.json")
-        for plan in plans:
-            commit, nums, patched = plan[0], plan[1], plan[2]
-            if not patched:
-                continue
-            for tid, sub in subunits.items():
-                n = by_id.get(tid)
-                if n is None or n not in nums or n in plan[6]:
-                    continue
-                q = _queries_for(sub, plan[5])
-                if q is None:
-                    continue  # a changed line runs outside the queries (setup, pool, import)
-                indices = [i for i in range(sub["queries"]) if q >> i & 1]
-                qms = sub.get("ms") or [ms[n] // max(sub["queries"], 1)] * sub["queries"]
-                est_ms = 900 + sum(qms[i] for i in indices)
-                save_ms = cost_ms(nums, ms) - cost_ms(set(nums) - {n}, ms)
-                if not indices:
-                    plan[1] = set(nums) - {n}
-                    log(f"{commit}: {tid.split('::')[-1]} runs no changed line in any query; dropped")
-                    nums = plan[1]
-                    continue
-                name = tid.split("::")[-1]
-                # Cheap check first: if the patch leaves the executor's own code alone
-                # and every query still parses, optimizes, plans and transpiles to the
-                # same thing, the executor sees identical input: the test cannot change.
-                exec_hit = any(p.startswith(("sqlglot/executor/", "tests/")) for p in patched) or any(
-                    ln in sub["exec"].get(path, ())
-                    for path, a, b in plan[5]
-                    for ln in range(a, b + 1)
-                )
-                if not exec_hit and name in base_fps and time_left():
-                    t0 = time.monotonic()
-                    fps = runner.tpc_fingerprint_check(str(SRC), patched, name, indices, timeout=30)
-                    spent += time.monotonic() - t0
-                    if fps is not None and len(fps) == len(indices):
-                        changed = [i for i, h in zip(indices, fps) if h != base_fps[name][i]]
-                        log(f"{commit}: {name} fingerprints of {len(indices)} queries in "
-                            f"{time.monotonic() - t0:.2f}s: {len(changed)} changed")
-                        if not changed:
-                            plan[1] = set(nums) - {n}
-                            nums = plan[1]
-                            continue
-                        indices = changed
-                        est_ms = 900 + sum(qms[i] for i in indices)
-                if est_ms + 1000 >= save_ms or spent + est_ms / 1000 > VERIFY_BUDGET_S or not time_left():
-                    continue
-                t0 = time.monotonic()
-                verdict = runner.run_tpc_queries(
-                    str(SRC), patched, tid.split("::")[-1], indices, timeout=3 * est_ms / 1000 + 5
-                )
-                spent += time.monotonic() - t0
-                log(f"{commit}: {tid.split('::')[-1]} replayed {len(indices)} queries in "
-                    f"{time.monotonic() - t0:.2f}s: {verdict}")
-                if verdict == "pass":
-                    plan[1] = set(nums) - {n}
-                    nums = plan[1]
-
-    # Scaled-down replicas of single huge tests (test_max_nodes, 28.8 s): if the
-    # patched code gives the replica the same tokens, trees and errors as the
-    # pinned code, the full-size test behaves the same.
-    replica_fps = _json("tpcfp.json").get("replicas", {}) if runner else {}
-    for plan in plans if runner else []:
-        commit, nums, patched = plan[0], plan[1], plan[2]
-        if not patched or any(p.startswith("tests/") for p in patched):
-            continue
-        for tid, base in replica_fps.items():
-            n = by_id.get(tid)
-            if n is None or n not in nums or not time_left():
-                continue
-            if cost_ms(nums, ms) - cost_ms(set(nums) - {n}, ms) < 1500:
-                continue
-            t0 = time.monotonic()
-            fp = runner.replica_check(str(SRC), patched, tid, timeout=20)
-            log(f"{commit}: {tid.split('::')[-1]} replica in {time.monotonic() - t0:.2f}s: "
-                f"{'same' if fp == base else 'changed' if fp else 'unavailable'}")
-            if fp == base:
-                plan[1] = set(nums) - {n}
-                nums = plan[1]
+    for plan in plans:
+        if plan[7] and not plan[8]:
+            plan[1] = set(plan[1]) | plan[7]  # refactor not confirmed by running the cheap tests
+            log(f"{plan[0]}: refactor not confirmed; held tests restored")
 
     total_cost = 0
     for commit, nums, *_ in plans:

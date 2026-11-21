@@ -3,7 +3,8 @@
 For each patch to sqlglot (pinned at `eb11aec`), this picks the tests that can
 fail and splits them over workers at the lowest cost. Nothing is run at score
 time except a few cheap checks that pay for themselves (below). On the 30
-sample commits: 141.5 s simulated, 0 misses, about 7 s of CPU. On 66
+sample commits: 94.4 s simulated (exactly the oracle), 0 misses, about 15 s of
+local CPU. On 66
 synthetic commits checked against real test runs: 0 misses. First practice
 submission (before the TPC fingerprints): 199.6 s simulated + 8.0 s CPU = 207.6 s.
 
@@ -79,6 +80,23 @@ pools are replaced by an in-process executor that still pickles.
    the test is dropped without running anything. Otherwise, only the queries
    whose fingerprints changed are replayed.
 
+5. **Measured CPU, not recorded seconds.** `tools/measure_cpu.py` records
+   what each test really costs in a warm forked child (`map/cpu.json`).
+   Recorded seconds include pytest and process-pool start-up: in total
+   103 s recorded against 36 s measured, and `test_execute_tpch` 3.9 s against
+   0.03 s. The selector times a small benchmark at start-up to scale these
+   costs to the scoring machine. It then runs every selected test that is
+   cheaper to run than to list, without stopping at the first failure, and
+   keeps only the tests that fail. It stops after 25 failures.
+6. **`is` ↔ `==` refactors.** When every change is a swap between `is` and
+   `==` (or `is not` and `!=`) against `None` or an `ENUM.MEMBER`, the
+   expensive tests are held back and the cheap ones are run. The held tests
+   come back if any cheap test fails or does not run.
+7. **Exact check for `test_optimized_tpch`.** Its only sqlglot step is
+   transpiling 22 TPC-H queries, and their optimized forms, to DuckDB. If
+   that SQL text is unchanged, so is the result.
+
+Any error inside these checks falls back to the static selection.
 A deadline (110 s) and a budget keep the batch well inside the 3-minute limit.
 
 The chosen tests are split with longest-processing-time-first for every

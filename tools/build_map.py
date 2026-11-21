@@ -110,8 +110,11 @@ def main() -> None:
                 opens[path] |= mask
 
     classes: dict[str, int] = defaultdict(int)
+    exec_classes: dict = defaultdict(set)  # split test -> classes instantiated while the executor runs
     for p in raw.glob("classes.*.json"):
         for ctx, names in json.loads(p.read_text()).items():
+            if ctx.startswith("x|"):
+                exec_classes[ctx[2:].rsplit("|", 1)[0]].update(names)
             mask = expand(ctx)
             for n in names:
                 classes[n] |= mask
@@ -138,6 +141,7 @@ def main() -> None:
             "lines": {f: {str(k): format(v, "x") for k, v in sorted(m.items())} for f, m in sub_lines[base].items()},
             "outside": {f: sorted(v) for f, v in sub_outside[base].items()},
             "exec": {f: sorted(v) for f, v in sub_exec[base].items()},
+            "exec_classes": sorted(exec_classes.get(base, ())),
         }
         for base in sub_count
     }
