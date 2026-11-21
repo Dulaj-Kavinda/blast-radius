@@ -878,7 +878,7 @@ def cost_ms(nums, ms) -> int:
 
 # Tests whose outcome a forked, in-memory run cannot reproduce faithfully.
 UNVERIFIABLE_RE = re.compile(r"::test_lazy_load$|^tests/test_sqlglotc\.py|::test_generator_memory$")
-VERIFY_MAX_TEST_MS = int(os.environ.get("BR_VERIFY_MAX_TEST_MS", "1500"))
+VERIFY_MAX_TEST_MS = int(os.environ.get("BR_VERIFY_MAX_TEST_MS", "4000"))
 VERIFY_OVERHEAD_MS = 250  # fork + fresh sqlglot / test imports, measured ~100-200 ms
 VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET_S", "75"))
 # Never let checks push the whole batch near the run limit (3 min, 4.5 in the final).
@@ -1061,6 +1061,28 @@ def main() -> None:
                 if verdict == "pass":
                     plan[1] = set(nums) - {n}
                     nums = plan[1]
+
+    # Scaled-down replicas of single huge tests (test_max_nodes, 28.8 s): if the
+    # patched code gives the replica the same tokens, trees and errors as the
+    # pinned code, the full-size test behaves the same.
+    replica_fps = _json("tpcfp.json").get("replicas", {}) if runner else {}
+    for plan in plans if runner else []:
+        commit, nums, patched = plan[0], plan[1], plan[2]
+        if not patched or any(p.startswith("tests/") for p in patched):
+            continue
+        for tid, base in replica_fps.items():
+            n = by_id.get(tid)
+            if n is None or n not in nums or not time_left():
+                continue
+            if cost_ms(nums, ms) - cost_ms(set(nums) - {n}, ms) < 1500:
+                continue
+            t0 = time.monotonic()
+            fp = runner.replica_check(str(SRC), patched, tid, timeout=20)
+            log(f"{commit}: {tid.split('::')[-1]} replica in {time.monotonic() - t0:.2f}s: "
+                f"{'same' if fp == base else 'changed' if fp else 'unavailable'}")
+            if fp == base:
+                plan[1] = set(nums) - {n}
+                nums = plan[1]
 
     total_cost = 0
     for commit, nums, *_ in plans:

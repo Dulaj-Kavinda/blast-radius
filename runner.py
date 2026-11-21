@@ -24,6 +24,16 @@ import sys
 import time
 
 
+def _debug(what: str) -> None:
+    """BR_RUNNER_DEBUG=<file>: append child tracebacks there (local debugging)."""
+    path = os.environ.get("BR_RUNNER_DEBUG")
+    if path:
+        import traceback
+
+        with open(path, "a") as f:
+            f.write(f"--- {what}\n{traceback.format_exc()}\n")
+
+
 def preload() -> bool:
     """Import the heavy, never-patched dependencies before forking."""
     try:
@@ -100,6 +110,7 @@ class _InlineExecutor:
             fn, args, kwargs = _roundtrip((fn, args, kwargs))
             fut.set_result(_roundtrip(fn(*args, **kwargs)))
         except BaseException as e:  # noqa: BLE001
+            _debug("child")
             fut.set_exception(e)
         return fut
 
@@ -124,6 +135,7 @@ def _child(root: str, files: dict[str, str], test_ids: list[str], wfd: int) -> N
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     os.environ["SKIP_INTEGRATION"] = "0"
+    root = os.path.abspath(root)
     os.chdir(root)
     sys.path.insert(0, root)
     sys.dont_write_bytecode = True
@@ -190,6 +202,7 @@ def _child(root: str, files: dict[str, str], test_ids: list[str], wfd: int) -> N
         # a test that never reports (killed by the stop) stays "not run"
         suite.run(result)
     except BaseException:  # noqa: BLE001
+        _debug("child")
         # an import error fails every test of that module
         for tid in test_ids:
             if tid not in results:
@@ -206,6 +219,7 @@ def _import_child(root: str, files: dict[str, str], wfd: int) -> None:
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     os.environ["SKIP_INTEGRATION"] = "0"
+    root = os.path.abspath(root)
     os.chdir(root)
     sys.path.insert(0, root)
     sys.dont_write_bytecode = True
@@ -217,6 +231,7 @@ def _import_child(root: str, files: dict[str, str], wfd: int) -> None:
 
         names = [i.name for i in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot.")]
     except BaseException:  # noqa: BLE001
+        _debug("child")
         failed.append("sqlglot")
         names = []
     names += sorted(f[:-3].replace("/", ".") for f in glob.glob("tests/**/*.py", recursive=True))
@@ -226,6 +241,7 @@ def _import_child(root: str, files: dict[str, str], wfd: int) -> None:
         try:
             importlib.import_module(name)
         except BaseException:  # noqa: BLE001
+            _debug("child")
             failed.append(name)
     os.write(wfd, (json.dumps(failed) + "\n").encode())
     os._exit(0)
@@ -238,6 +254,7 @@ def _tpc_child(root, files, test_name, indices, wfd):
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     os.environ["SKIP_INTEGRATION"] = "0"
+    root = os.path.abspath(root)
     os.chdir(root)
     sys.path.insert(0, root)
     sys.dont_write_bytecode = True
@@ -265,6 +282,7 @@ def _tpc_child(root, files, test_name, indices, wfd):
                 case.subtestHelper(i, table, tpch=tpch)
         verdict = "pass"
     except BaseException:  # noqa: BLE001
+        _debug("child")
         verdict = "fail"
     os.write(wfd, (json.dumps(verdict) + "\n").encode())
     os._exit(0)
@@ -419,6 +437,7 @@ def tpc_fingerprints(test_name: str, indices=None) -> list[str]:
                 parts.append(transpile(sql, write="duckdb")[0])
             blob = json.dumps(parts, sort_keys=True, default=repr)
         except BaseException as e:  # noqa: BLE001
+            _debug("child")
             blob = f"error {type(e).__name__}: {e}"
         out.append(hashlib.sha256(blob.encode()).hexdigest()[:16])
     return out
@@ -431,6 +450,7 @@ def _fp_child(root, files, test_name, indices, wfd):
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     os.environ["SKIP_INTEGRATION"] = "0"
+    root = os.path.abspath(root)
     os.chdir(root)
     sys.path.insert(0, root)
     sys.dont_write_bytecode = True
@@ -439,6 +459,7 @@ def _fp_child(root, files, test_name, indices, wfd):
     try:
         out = tpc_fingerprints(test_name, indices)
     except BaseException:  # noqa: BLE001
+        _debug("child")
         out = None
     os.write(wfd, (json.dumps(out) + "\n").encode())
     os._exit(0)
@@ -452,6 +473,86 @@ def tpc_fingerprint_check(root: str, files: dict[str, str], test_name: str, indi
         os.close(rfd)
         try:
             _fp_child(root, files, test_name, indices, wfd)
+        finally:
+            os._exit(1)
+    os.close(wfd)
+    buf = _read_until(rfd, pid, timeout)
+    try:
+        return json.loads(buf.decode().strip().split("\n")[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+# ----------------------------------------------------------- scaled-down replicas
+
+
+def _replica_max_nodes():
+    """tests/test_parser.py::TestParser::test_max_nodes at a smaller scale.
+    The real test parses a 10,000-column query (28.8 s). Node counting is a
+    plain per-node counter, so the same statements on a 260-column query
+    (~52k nodes) exercise the same code: tokens, trees and error messages."""
+    from sqlglot import parse_one
+    from sqlglot.serde import dump
+
+    out = []
+
+    def rec(fn):
+        try:
+            r = fn()
+            out.append(["ok", dump(r) if r is not None else None])
+        except Exception as e:  # noqa: BLE001
+            out.append(["err", type(e).__name__, str(e)])
+
+    rec(lambda: parse_one("SELECT 1", max_nodes=1_000_000))
+    cols = [f"col{i}" for i in range(500)]
+    rec(lambda: parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000))
+    expr = "x" + "=x" * 100
+    small = "SELECT " + ",".join(expr for _ in range(20))
+    rec(lambda: parse_one(small, max_nodes=1_000_000))
+    rec(lambda: parse_one(small, max_nodes=1_500))
+    big = "SELECT " + ",".join(expr for _ in range(260))
+    rec(lambda: parse_one(big, max_nodes=50_000))
+    rec(lambda: parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5))
+    rec(lambda: parse_one("SELECT 1, 2, 3"))
+    return out
+
+
+REPLICAS = {"tests/test_parser.py::TestParser::test_max_nodes": _replica_max_nodes}
+
+
+def replica_fingerprint(test_id: str) -> str:
+    import hashlib
+
+    blob = json.dumps(REPLICAS[test_id](), sort_keys=True, default=repr)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def _replica_child(root, files, test_id, wfd):
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    root = os.path.abspath(root)
+    os.chdir(root)
+    sys.path.insert(0, root)
+    sys.dont_write_bytecode = True
+    sys.meta_path.insert(0, _Overlay(root, files))
+    try:
+        out = replica_fingerprint(test_id)
+    except BaseException:  # noqa: BLE001
+        _debug("replica")
+        out = None
+    os.write(wfd, (json.dumps(out) + "\n").encode())
+    os._exit(0)
+
+
+def replica_check(root: str, files: dict[str, str], test_id: str, timeout: float):
+    """Fingerprint of the replica of test_id with files overlaid, or None."""
+    rfd, wfd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(rfd)
+        try:
+            _replica_child(root, files, test_id, wfd)
         finally:
             os._exit(1)
     os.close(wfd)

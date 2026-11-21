@@ -21,5 +21,7 @@ rm -rf map
 # unpatched TPC fingerprints (runner.tpc_fingerprints), for the selector's cheap check
 (cd "$SQ" && env SKIP_INTEGRATION=0 PYTHONPATH="$SQ:$HERE" "$WORK/venv/bin/python" -c "
 import json, runner
-json.dump({t: runner.tpc_fingerprints(t) for t in ('test_execute_tpcds', 'test_execute_tpch')}, open('$HERE/map/tpcfp.json', 'w'))
+fp = {t: runner.tpc_fingerprints(t) for t in ('test_execute_tpcds', 'test_execute_tpch')}
+fp['replicas'] = {t: runner.replica_fingerprint(t) for t in runner.REPLICAS}
+json.dump(fp, open('$HERE/map/tpcfp.json', 'w'))
 " 2>/dev/null)
