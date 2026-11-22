@@ -19,7 +19,7 @@ rm -rf map
 "$WORK/venv/bin/python" tools/importtrace.py "$SQ" "$WORK/importtrace.json"
 "$WORK/venv/bin/python" tools/build_static.py "$SQ" map "$WORK/venv/bin/python" "$WORK/importtrace.json"
 # unpatched TPC fingerprints (runner.tpc_fingerprints), for the selector's cheap check
-(cd "$SQ" && env SKIP_INTEGRATION=0 PYTHONPATH="$SQ:$HERE" "$WORK/venv/bin/python" -c "
+(cd "$SQ" && env PYTHONHASHSEED=0 SKIP_INTEGRATION=0 PYTHONPATH="$SQ:$HERE" "$WORK/venv/bin/python" -c "
 import json, runner
 fp = {t: runner.tpc_fingerprints(t) for t in ('test_execute_tpcds', 'test_execute_tpch')}
 fp['replicas'] = {t: runner.replica_fingerprint(t) for t in runner.REPLICAS}

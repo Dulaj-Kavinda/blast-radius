@@ -9,7 +9,7 @@ DATA="${1:-$KIT/sample}"
 OUT="$HERE/.work/output.jsonl"
 PY="${PY:-$HERE/.work/venv/bin/python}"
 
-/usr/bin/time -p env BR_DATA="$DATA" BR_SRC="$HERE/.work/sqlglot" BR_MAP="$HERE/map" \
+/usr/bin/time -p env PYTHONHASHSEED=0 BR_DATA="$DATA" BR_SRC="$HERE/.work/sqlglot" BR_MAP="$HERE/map" \
     "$PY" "$HERE/selector.py" > "$OUT" 2> "$HERE/.work/selector.log" || { tail -20 "$HERE/.work/selector.log"; exit 1; }
 grep -E "^(real|user|sys)" "$HERE/.work/selector.log" | tr '\n' ' '; echo
 python3 "$KIT/score.py" "$DATA" "$DATA/answers.json" "$OUT"

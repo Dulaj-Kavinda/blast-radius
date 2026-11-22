@@ -582,6 +582,7 @@ class Analyzer:
         self.cls_impure = False  # a class change also reached module-level names
         self.spans: list[tuple[str, int, int]] = []  # line ranges whose coverage selected tests
         self.nonline = 0  # tests selected for any other reason (class users, imports, data...)
+        self.data_sel = 0  # tests selected because they read a changed fixture (served patched in the checks)
         self._path = ""
 
     # masks over sets of lines ------------------------------------------------
@@ -673,9 +674,10 @@ class Analyzer:
             return self._nl(self.special("discovery") | self.special("lazy_load"))
         old = old_path.read_text(encoding="utf-8")
         new = apply_hunks(old, fd.hunks)
-        mask = self._nl(opens_mask(path))  # tests that read this source as text
-        self.blocked |= mask
+        mask = self._nl(opens_mask(path))  # tests that read this source as text (served patched)
         if same_tokens(old, new):
+            if mask:
+                self.patched[path] = new
             return mask
         try:
             ast.parse(new)
@@ -842,9 +844,13 @@ class Analyzer:
     def file_effect(self, fd: FileDiff) -> int:
         if not (fd.path.endswith(".py") and fd.path.startswith("sqlglot/")) or fd.new_file or fd.deleted:
             self.equiv = False
+        before = set(self.patched)
         m = self._file_effect(fd)
         if not (fd.path.endswith(".py") and (fd.path.startswith("sqlglot/") or fd.path.startswith("tests/"))):
-            self.nonline |= m
+            if fd.path in self.patched and fd.path not in before:
+                self.data_sel |= m  # an overlaid fixture: the checks see its new text
+            else:
+                self.nonline |= m
         return m
 
     def _file_effect(self, fd: FileDiff) -> int:
@@ -872,10 +878,36 @@ class Analyzer:
         m = opens_mask(path)
         if m and path.endswith(".sql") and not fd.binary and _sql_comment_only(fd):
             return 0
-        self.blocked |= m  # a data file the tests read: cannot overlay it
-        if fd.deleted and m:
+        if m and self.overlay_data(path, fd):
             return m
+        self.blocked |= m  # a data file the tests read that cannot be overlaid
         return m
+
+    def overlay_data(self, path: str, fd: FileDiff) -> bool:
+        """Text fixtures read with open() are served patched in the run-time checks."""
+        if (
+            not path.startswith("tests/")
+            or not path.endswith(OVERLAY_EXT)
+            or fd.binary
+            or fd.deleted
+            or fd.new_file
+            or (fd.old_path and fd.new_path and fd.old_path != fd.new_path)
+            or path != fd.path
+        ):
+            return False
+        old_path = SRC / path
+        if not old_path.is_file():
+            return False
+        try:
+            old = old_path.read_text(encoding="utf-8")
+            self.patched[path] = apply_hunks(old, fd.hunks)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+
+# fixtures the tests read with open() (duckdb reads the .csv.gz data itself)
+OVERLAY_EXT = (".sql", ".json", ".txt")
 
 
 def _mentions_pytest(fd: FileDiff) -> bool:
@@ -1011,7 +1043,7 @@ def main() -> None:
         plans.append([commit, nums, patched, to_numbers(an.direct), risky, list(an.spans), to_numbers(an.nonline),
                       held, False, to_numbers(an.blocked),
                       (to_numbers(an.nonline_cls) - to_numbers(an.nonline), set(an.changed_classes), an.cls_impure),
-                      False])
+                      False, False, to_numbers(an.data_sel) - to_numbers(an.nonline)])
 
     # Run-time verification: for commits where running the cheap selected tests
     # is expected to cost less than listing them, run them and drop the ones
@@ -1048,7 +1080,7 @@ def main() -> None:
                         extra |= an.module_users(m)
                     if new:
                         log(f"{plan[0]}: import fails for {new[:5]}{'...' if len(new) > 5 else ''}")
-                        plan[2] = None  # most tests fail anyway: nothing to gain from verifying
+                        plan[9] = set(plan[9]) | to_numbers(extra)  # they fail: never run them here
                 plan[1] = set(plan[1]) | to_numbers(extra)
                 plan[6] = set(plan[6]) | to_numbers(extra)
                 plan[11] = True
@@ -1062,84 +1094,125 @@ def main() -> None:
             global CPU_FACTOR
             if "BR_CPU_FACTOR" not in os.environ and cpu.get("bench_ms"):
                 # this machine vs the one the map was measured on, with 15% headroom
-                CPU_FACTOR = min(max(1.05 * runner.bench_ms() / cpu["bench_ms"], 0.8), 5.0)
+                CPU_FACTOR = min(max(1.05 * min(runner.bench_ms(), runner.bench_ms()) / cpu["bench_ms"], 0.8), 5.0)
                 log(f"cpu factor {CPU_FACTOR:.2f}")
             cpu_t, cpu_setup, cpu_imp = cpu.get("tests", {}), cpu.get("setup", {}), cpu.get("import", {})
             cpu_warm = cpu.get("warmup", {})
             untrusted = set(cpu.get("baseline_fail", []))
             own_checks = set(_json("subunits.json")) | set(_json("tpcfp.json").get("replicas", {}))
 
-            def pred_ms(n):
+            def pred_ms(n, part=None):
                 c = cpu_t.get(id_of[n])
-                return CPU_FACTOR * c if c is not None else ms[n]
+                if c is None:
+                    return ms[n]
+                return CPU_FACTOR * c * (part.get(n, 1.0) if part else 1.0)
 
-            def run_cost(sel):
+            fxunits = None
+
+            def fx_parts(plan, runnable):
+                """Tests looping over fixture entries, selected only through changed
+                lines that run inside some entries: run just those entries."""
+                nonlocal fxunits
+                if fxunits is None:
+                    fxunits = _json("fxunits.json")
+                    for u in fxunits.values():
+                        u["outside"] = {k: set(v) for k, v in u["outside"].items()}
+                subsets, part = {}, {}
+                skip = set(plan[6]) | set(plan[10][0]) | set(plan[13])
+                for n in runnable:
+                    u = fxunits.get(id_of[n])
+                    if u is None or n in skip or not u["items"]:
+                        continue
+                    q = _queries_for(u, plan[5])
+                    if q is None:
+                        continue
+                    idx = [k for k in range(u["items"]) if q >> k & 1]
+                    total = sum(u["ms"]) or 1.0
+                    subsets[id_of[n]] = idx
+                    part[n] = max(sum(u["ms"][k] for k in idx) / total, 0.01)
+                return subsets, part
+
+            def run_cost(sel, part=None):
                 files, classes = set(), set()
                 total = VERIFY_OVERHEAD_MS
                 for n in sel:
                     parts = id_of[n].split("::")
                     files.add(parts[0])
                     classes.add("::".join(parts[:2]))
-                    total += pred_ms(n)
+                    total += pred_ms(n, part)
                 total += CPU_FACTOR * sum(cpu_setup.get(c, 0) + 0 for c in classes)
                 total += CPU_FACTOR * sum(cpu_imp.get(f, 50) + cpu_warm.get(f, 0) for f in files)
                 return total
 
-            candidates = []
-            for plan in plans:
-                commit, nums, patched, direct = plan[:4]
-                if not patched or not nums:
-                    continue
-                runnable = [
-                    n for n in nums
-                    if not UNVERIFIABLE_RE.search(id_of[n]) and id_of[n] not in untrusted and id_of[n] not in own_checks
-                    and n not in plan[9]
-                ]
-                if not runnable:
-                    continue
-                base_cost = cost_ms(nums, ms)
-                best = None
-                for r in (0.0, 1.0, 2.0, 4.0, 10.0):
-                    sel = [n for n in runnable if ms[n] >= r * pred_ms(n)]
-                    if not sel or (best and len(sel) == len(best[2])):
+            def verify_round(spent):
+                candidates = []
+                for plan in plans:
+                    commit, nums, patched, direct = plan[:4]
+                    if os.environ.get("BR_DEBUG"):
+                        log(f"DBG {commit}: patched={bool(patched)} nums={len(nums)} blocked={len(plan[9])}")
+                    if not patched or not nums or plan[12]:
                         continue
-                    rc = run_cost(sel)
-                    gain = base_cost - cost_ms(set(nums) - set(sel), ms) - rc
-                    if best is None or gain > best[0]:
-                        best = (gain, rc, sel)
-                if plan[7] and best:
-                    best = (best[0] + cost_ms(set(nums) | plan[7], ms), best[1], runnable)  # must run them all
-                if best and best[0] > 200:
-                    # likeliest failures first: tests that ran the changed lines, cheapest first
-                    order = sorted(best[2], key=lambda n: (n not in direct, pred_ms(n)))
-                    # keep each class together: unittest re-runs setUpClass whenever the class changes
-                    rank = {}
-                    for n in order:
-                        rank.setdefault("::".join(id_of[n].split("::")[:2]), len(rank))
-                    order.sort(key=lambda n: rank["::".join(id_of[n].split("::")[:2])])
-                    candidates.append((best[0], plan, order, best[1]))
-            spent = 0.0
-            for gain, plan, order, run_ms in sorted(candidates, key=lambda c: -c[0]) if verify_on else []:
-                if spent + run_ms / 1000 > VERIFY_BUDGET_S or not time_left():
-                    continue
-                t0 = time.monotonic()
-                res = runner.verify(
-                    str(SRC), plan[2], [id_of[n] for n in order], timeout=3 * run_ms / 1000 + 5,
-                    max_failures=VERIFY_MAX_FAILURES,
-                )
-                spent += time.monotonic() - t0
-                passed = {by_id[t] for t, v in res.items() if v == "pass"}
-                failed = [t for t, v in res.items() if v == "fail"]
-                plan[1] = set(plan[1]) - passed
-                if plan[7]:
-                    ran_all = all(res.get(id_of[n]) == "pass" for n in order)
-                    if not ran_all:
-                        plan[1] |= plan[7]
-                    plan[7] = set() if not ran_all else plan[7]
-                    plan[8] = ran_all
-                log(f"{plan[0]}: verified {len(res)}/{len(order)} tests in {time.monotonic() - t0:.2f}s "
-                    f"(predicted {run_ms / 1000:.2f}s), {len(failed)} failing, {len(passed)} dropped")
-            log(f"verification wall time {spent:.1f}s")
+                    runnable = [
+                        n for n in nums
+                        if not UNVERIFIABLE_RE.search(id_of[n]) and id_of[n] not in untrusted and id_of[n] not in own_checks
+                        and n not in plan[9]
+                    ]
+                    if not runnable:
+                        continue
+                    subsets, part = fx_parts(plan, runnable)
+                    base_cost = cost_ms(nums, ms)
+                    best = None
+                    for r in (0.0, 1.0, 2.0, 4.0, 10.0):
+                        sel = [n for n in runnable if ms[n] >= r * pred_ms(n, part)]
+                        if not sel or (best and len(sel) == len(best[2])):
+                            continue
+                        rc = run_cost(sel, part)
+                        gain = base_cost - cost_ms(set(nums) - set(sel), ms) - rc
+                        if os.environ.get("BR_DEBUG"):
+                            log(f"DBG   {commit} r={r} sel={len(sel)} rc={rc:.0f} base={base_cost} rest={cost_ms(set(nums) - set(sel), ms)}")
+                        if best is None or gain > best[0]:
+                            best = (gain, rc, sel)
+                    if plan[7] and best:
+                        best = (best[0] + cost_ms(set(nums) | plan[7], ms), best[1], runnable)  # must run them all
+                    if os.environ.get("BR_DEBUG"):
+                        log(f"DBG {commit}: runnable={len(runnable)} best={best and (round(best[0]), round(best[1]), len(best[2]))}")
+                    if best and best[0] > 200 + 0.15 * best[1]:  # margin for CPU-estimate error
+                        # likeliest failures first: tests that ran the changed lines, cheapest first
+                        order = sorted(best[2], key=lambda n: (n not in direct, pred_ms(n, part)))
+                        # keep each class together: unittest re-runs setUpClass whenever the class changes
+                        rank = {}
+                        for n in order:
+                            rank.setdefault("::".join(id_of[n].split("::")[:2]), len(rank))
+                        order.sort(key=lambda n: rank["::".join(id_of[n].split("::")[:2])])
+                        chosen = {id_of[n] for n in order}
+                        candidates.append((best[0], plan, order, best[1], {t: v for t, v in subsets.items() if t in chosen}))
+                for gain, plan, order, run_ms, subs in sorted(candidates, key=lambda c: -c[0]) if verify_on else []:
+                    if spent + run_ms / 1000 > VERIFY_BUDGET_S or not time_left():
+                        log(f"{plan[0]}: verification skipped (budget: {spent:.1f}s spent, {run_ms / 1000:.1f}s more)")
+                        continue
+                    plan[12] = True
+                    t0 = time.monotonic()
+                    res = runner.verify(
+                        str(SRC), plan[2], [id_of[n] for n in order], timeout=3 * run_ms / 1000 + 5,
+                        max_failures=VERIFY_MAX_FAILURES, subsets=subs,
+                    )
+                    spent += time.monotonic() - t0
+                    passed = {by_id[t] for t, v in res.items() if v == "pass"}
+                    failed = [t for t, v in res.items() if v == "fail"]
+                    plan[1] = set(plan[1]) - passed
+                    if plan[7]:
+                        ran_all = all(res.get(id_of[n]) == "pass" for n in order)
+                        if not ran_all:
+                            plan[1] |= plan[7]
+                        plan[7] = set() if not ran_all else plan[7]
+                        plan[8] = ran_all
+                    log(f"{plan[0]}: verified {len(res)}/{len(order)} tests in {time.monotonic() - t0:.2f}s "
+                        f"(predicted {run_ms / 1000:.2f}s), {len(failed)} failing, {len(passed)} dropped"
+                        + (f", {len(subs)} on fixture entries" if subs else ""))
+                log(f"verification wall time {spent:.1f}s")
+                return spent
+
+            spent = verify_round(0.0)
 
             # Scaled-down replicas of single huge tests (test_max_nodes, 28.8 s): if the
             # patched code gives the replica the same tokens, trees and errors as the
@@ -1147,13 +1220,13 @@ def main() -> None:
             replica_fps = _json("tpcfp.json").get("replicas", {}) if runner else {}
             for plan in plans if runner else []:
                 commit, nums, patched = plan[0], plan[1], plan[2]
-                if not patched or any(p.startswith("tests/") for p in patched):
+                if not patched or any(p.startswith("tests/") and p.endswith(".py") for p in patched):
                     continue
                 for tid, base in replica_fps.items():
                     n = by_id.get(tid)
                     if n is None or n not in nums or n in plan[9] or not time_left():
                         continue
-                    if cost_ms(nums, ms) - cost_ms(set(nums) - {n}, ms) < 1500:
+                    if ms[n] < 1500:  # the check costs ~0.3 s; the second verification round may free the rest
                         continue
                     t0 = time.monotonic()
                     fp = runner.replica_check(str(SRC), patched, tid, timeout=20)
@@ -1180,8 +1253,16 @@ def main() -> None:
                     q = _queries_for(sub, plan[5])
                     if q is None:
                         continue  # a changed line runs outside the queries (setup, pool, import)
+                    name = tid.split("::")[-1]
+                    data_hit = n in plan[13]  # reads a changed fixture: every query may differ
+                    if data_hit:
+                        if name not in base_fps:
+                            continue
+                        q = (1 << len(base_fps[name])) - 1
                     cls_only, changed_classes, impure = plan[10]
-                    if n in cls_only:
+                    if data_hit:
+                        pass
+                    elif n in cls_only:
                         # selected as a user of a changed class attribute: every query may see
                         # it, but if the executor itself never instantiates the class, the
                         # fingerprints still cover all that can change
@@ -1197,20 +1278,24 @@ def main() -> None:
                         log(f"{commit}: {tid.split('::')[-1]} runs no changed line in any query; dropped")
                         nums = plan[1]
                         continue
-                    name = tid.split("::")[-1]
                     # Cheap check first: if the patch leaves the executor's own code alone
                     # and every query still parses, optimizes, plans and transpiles to the
                     # same thing, the executor sees identical input: the test cannot change.
-                    exec_hit = any(p.startswith(("sqlglot/executor/", "tests/")) for p in patched) or any(
+                    exec_hit = any(
+                        p.startswith("sqlglot/executor/") or (p.startswith("tests/") and p.endswith(".py"))
+                        for p in patched
+                    ) or any(
                         ln in sub["exec"].get(path, ())
                         for path, a, b in plan[5]
                         for ln in range(a, b + 1)
                     )
                     if not exec_hit and name in base_fps and time_left():
                         t0 = time.monotonic()
-                        fps = runner.tpc_fingerprint_check(str(SRC), patched, name, indices, timeout=30)
+                        fps = runner.tpc_fingerprint_check(
+                            str(SRC), patched, name, None if data_hit else indices, timeout=30
+                        )
                         spent += time.monotonic() - t0
-                        if fps is not None and len(fps) == len(indices):
+                        if fps is not None and len(fps) == len(indices):  # data_hit: same query count too
                             changed = [i for i, h in zip(indices, fps) if h != base_fps[name][i]]
                             log(f"{commit}: {name} fingerprints of {len(indices)} queries in "
                                 f"{time.monotonic() - t0:.2f}s: {len(changed)} changed")
@@ -1220,6 +1305,9 @@ def main() -> None:
                                 continue
                             indices = changed
                             est_ms = 900 + sum(qms[i] for i in indices)
+                            data_hit = False  # same query count, the changed ones are replayed
+                    if data_hit:
+                        continue  # no trustworthy query list for a changed fixture: keep the test
                     if est_ms + 1000 >= save_ms or spent + est_ms / 1000 > VERIFY_BUDGET_S or not time_left():
                         continue
                     t0 = time.monotonic()
@@ -1232,6 +1320,10 @@ def main() -> None:
                     if verdict == "pass":
                         plan[1] = set(nums) - {n}
                         nums = plan[1]
+
+            # Second round: once the replica / TPC checks dropped a big test, running
+            # the remaining cheap tests can pay where it did not before.
+            spent = verify_round(spent)
 
     except Exception as e:  # a failed check must never fail the run
         log(f"run-time checks stopped ({type(e).__name__}: {e}); keeping the static selection")

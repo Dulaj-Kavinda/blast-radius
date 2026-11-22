@@ -24,7 +24,7 @@ import sys
 import time
 
 
-def bench_ms(rounds: int = 5) -> float:
+def bench_ms(rounds: int = 15) -> float:
     """CPU ms of a fixed pure-Python workload (dicts, strings, calls: like
     sqlglot's), best of `rounds`. Compared with the same number measured when
     the map was built, it calibrates per-test CPU costs to this machine."""
@@ -87,6 +87,8 @@ class _Overlay(importlib.abc.MetaPathFinder):
     def __init__(self, root: str, files: dict[str, str]):
         self.mods = {}
         for rel, src in files.items():
+            if not rel.endswith(".py"):
+                continue
             name = rel[:-3].replace("/", ".")
             is_pkg = name.endswith(".__init__")
             if is_pkg:
@@ -144,9 +146,34 @@ class _InlineExecutor:
         return False
 
 
-def _child(root: str, files: dict[str, str], test_ids: list[str], wfd: int, max_failures: int = 1) -> None:
+def _install_open_overlay(root: str, files: dict[str, str]) -> None:
+    """Serve the patched text of changed files to open() / Path.read_text, for
+    fixtures and for sources the tests read as text. Writes go to the disk."""
+    import builtins
+    import io
+
+    data = {os.path.realpath(os.path.join(root, rel)): src for rel, src in files.items()}
+    if not data:
+        return
+    real_open = io.open
+
+    def open_(file, mode="r", *args, **kwargs):
+        if isinstance(file, (str, bytes, os.PathLike)) and not any(c in mode for c in "wax+"):
+            try:
+                src = data.get(os.path.realpath(os.fsdecode(file)))
+            except (TypeError, ValueError):
+                src = None
+            if src is not None:
+                return io.BytesIO(src.encode("utf-8")) if "b" in mode else io.StringIO(src)
+        return real_open(file, mode, *args, **kwargs)
+
+    builtins.open = open_
+    io.open = open_
+
+
+def _enter(root: str, files: dict[str, str], pools: bool = True) -> str:
+    """Common child set-up: silence output, serve the patched tree."""
     import concurrent.futures
-    import unittest
 
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
@@ -156,8 +183,58 @@ def _child(root: str, files: dict[str, str], test_ids: list[str], wfd: int, max_
     os.chdir(root)
     sys.path.insert(0, root)
     sys.dont_write_bytecode = True
-    concurrent.futures.ProcessPoolExecutor = _InlineExecutor
+    if pools:
+        concurrent.futures.ProcessPoolExecutor = _InlineExecutor
     sys.meta_path.insert(0, _Overlay(root, files))
+    _install_open_overlay(root, files)
+    return root
+
+
+_FX = {"allowed": None, "k": 0}
+
+
+def _fx_loader(orig):
+    """A fixture loader that yields only the entries chosen for the running
+    test. Entries are numbered across every loader call of the test, as in the
+    map (tools/mapplugin.py); outside a test it is the original loader."""
+
+    def loader(filename):
+        if _FX["allowed"] is None:
+            yield from orig(filename)
+            return
+        for item in orig(filename):
+            k = _FX["k"]
+            _FX["k"] += 1
+            if k in _FX["allowed"]:
+                yield item
+
+    loader._fxwrapped = True
+    return loader
+
+
+def _install_fx(mod) -> None:
+    helpers = sys.modules.get("tests.helpers")
+    if helpers is None:
+        return
+    if not getattr(helpers.load_sql_fixture_pairs, "_fxwrapped", False):
+        helpers._fx_orig = (helpers.load_sql_fixture_pairs, helpers.load_sql_fixtures)
+        helpers.load_sql_fixture_pairs = _fx_loader(helpers._fx_orig[0])
+        helpers.load_sql_fixtures = _fx_loader(helpers._fx_orig[1])
+    pairs, single = helpers._fx_orig
+    if getattr(mod, "load_sql_fixture_pairs", None) is pairs:
+        mod.load_sql_fixture_pairs = helpers.load_sql_fixture_pairs
+    if getattr(mod, "load_sql_fixtures", None) is single:
+        mod.load_sql_fixtures = helpers.load_sql_fixtures
+
+
+def _child(
+    root: str, files: dict[str, str], test_ids: list[str], wfd: int, max_failures: int = 1, subsets=None
+) -> None:
+    import concurrent.futures
+    import unittest
+
+    root = _enter(root, files)
+    subsets = {t: set(v) for t, v in (subsets or {}).items()}
 
     results: dict[str, str] = {}
 
@@ -168,6 +245,15 @@ def _child(root: str, files: dict[str, str], test_ids: list[str], wfd: int, max_
         os.write(wfd, (json.dumps([tid, verdict]) + "\n").encode())
 
     class Result(unittest.TestResult):
+        def startTest(self, test):
+            super().startTest(test)
+            _FX["allowed"] = subsets.get(getattr(test, "_br_id", None))
+            _FX["k"] = 0
+
+        def stopTest(self, test):
+            _FX["allowed"] = None
+            super().stopTest(test)
+
         def _mark(self, test, ok):
             tid = getattr(test, "_br_id", None)
             if tid is None:
@@ -213,6 +299,8 @@ def _child(root: str, files: dict[str, str], test_ids: list[str], wfd: int, max_
         for tid in test_ids:
             path, cls_name, meth = tid.split("::")
             mod = importlib.import_module(path[:-3].replace("/", "."))
+            if subsets:
+                _install_fx(mod)
             case = getattr(mod, cls_name)(meth)
             case._br_id = tid
             suite.addTest(case)
@@ -233,16 +321,7 @@ def _import_child(root: str, files: dict[str, str], wfd: int) -> None:
     import glob
     import pkgutil
 
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, 1)
-    os.dup2(devnull, 2)
-    os.environ["SKIP_INTEGRATION"] = "0"
-    root = os.path.abspath(root)
-    os.chdir(root)
-    sys.path.insert(0, root)
-    sys.dont_write_bytecode = True
-    concurrent.futures.ProcessPoolExecutor = _InlineExecutor
-    sys.meta_path.insert(0, _Overlay(root, files))
+    root = _enter(root, files)
     failed = []
     try:
         import sqlglot
@@ -268,16 +347,7 @@ def _import_child(root: str, files: dict[str, str], wfd: int) -> None:
 def _tpc_child(root, files, test_name, indices, wfd):
     import concurrent.futures
 
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, 1)
-    os.dup2(devnull, 2)
-    os.environ["SKIP_INTEGRATION"] = "0"
-    root = os.path.abspath(root)
-    os.chdir(root)
-    sys.path.insert(0, root)
-    sys.dont_write_bytecode = True
-    concurrent.futures.ProcessPoolExecutor = _InlineExecutor
-    sys.meta_path.insert(0, _Overlay(root, files))
+    root = _enter(root, files)
     verdict = "fail"
     try:
         mod = importlib.import_module("tests.test_executor")
@@ -365,7 +435,7 @@ def _read_until(rfd: int, pid: int, timeout: float) -> bytes:
 
 
 def verify(
-    root: str, files: dict[str, str], test_ids: list[str], timeout: float, max_failures: int = 1
+    root: str, files: dict[str, str], test_ids: list[str], timeout: float, max_failures: int = 1, subsets=None
 ) -> dict[str, str]:
     """Run test_ids against root with files overlaid. Returns {id: pass|fail}."""
     if not test_ids:
@@ -375,7 +445,7 @@ def verify(
     if pid == 0:
         os.close(rfd)
         try:
-            _child(root, files, test_ids, wfd, max_failures)
+            _child(root, files, test_ids, wfd, max_failures, subsets)
         finally:
             os._exit(1)
     os.close(wfd)
@@ -439,6 +509,9 @@ def tpc_fingerprints(test_name: str, indices=None) -> list[str]:
     tpch = test_name == "test_execute_tpch"
     path = "optimizer/tpc-h/tpc-h.sql" if tpch else "optimizer/tpc-ds/tpc-ds.sql"
     sqls = list(helpers.load_sql_fixture_pairs(path))
+    # TestExecutor.setUpClass loads both fixture files: an error there fails every query
+    for other in ("optimizer/tpc-h/tpc-h.sql", "optimizer/tpc-ds/tpc-ds.sql"):
+        list(helpers.load_sql_fixture_pairs(other))
     schema_dict = mod.TPCH_SCHEMA if tpch else mod.TPCDS_SCHEMA
     out = []
     for i in range(len(sqls)) if indices is None else indices:
@@ -466,16 +539,7 @@ def tpc_fingerprints(test_name: str, indices=None) -> list[str]:
 def _fp_child(root, files, test_name, indices, wfd):
     import concurrent.futures
 
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, 1)
-    os.dup2(devnull, 2)
-    os.environ["SKIP_INTEGRATION"] = "0"
-    root = os.path.abspath(root)
-    os.chdir(root)
-    sys.path.insert(0, root)
-    sys.dont_write_bytecode = True
-    concurrent.futures.ProcessPoolExecutor = _InlineExecutor
-    sys.meta_path.insert(0, _Overlay(root, files))
+    root = _enter(root, files)
     try:
         out = tpc_fingerprints(test_name, indices)
     except BaseException:  # noqa: BLE001
@@ -570,15 +634,7 @@ def replica_fingerprint(test_id: str) -> str:
 
 
 def _replica_child(root, files, test_id, wfd):
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, 1)
-    os.dup2(devnull, 2)
-    os.environ["SKIP_INTEGRATION"] = "0"
-    root = os.path.abspath(root)
-    os.chdir(root)
-    sys.path.insert(0, root)
-    sys.dont_write_bytecode = True
-    sys.meta_path.insert(0, _Overlay(root, files))
+    root = _enter(root, files, pools=False)
     try:
         out = replica_fingerprint(test_id)
     except BaseException:  # noqa: BLE001

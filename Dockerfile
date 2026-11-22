@@ -20,7 +20,7 @@ COPY map /app/map
 RUN chmod -R a+rX /app
 
 # The disk is read-only at run time: bytecode was compiled above.
-ENV PYTHONDONTWRITEBYTECODE=1 BR_DATA=/data BR_MAP=/app/map BR_SRC=/app/sqlglot SKIP_INTEGRATION=0 \
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 BR_DATA=/data BR_MAP=/app/map BR_SRC=/app/sqlglot SKIP_INTEGRATION=0 \
     OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 WORKDIR /app
 CMD ["python", "-s", "/app/selector.py"]

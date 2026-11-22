@@ -96,6 +96,23 @@ pools are replaced by an in-process executor that still pickles.
    transpiling 22 TPC-H queries, and their optimized forms, to DuckDB. If
    that SQL text is unchanged, so is the result.
 
+8. **Changed fixtures are served patched.** Text fixtures (`.sql`, `.json`)
+   and sources read as text are served from memory to `open()` and
+   `Path.read_text` in the children, so fixture commits are verified like code.
+   A change to `tpc-ds.sql` or `tpc-h.sql` (read by all 61 `TestExecutor`
+   tests, about 33 s) is checked by fingerprinting every query with the new
+   text and replaying only the changed ones.
+9. **Fixture entries.** Tests that loop over fixture files (`check_file` in
+   `test_optimizer`, identity loops) have per-entry coverage in
+   `map/fxunits.json`. When a test was selected only through changed lines,
+   the child runs just the entries that executed them.
+10. **Two verification rounds.** The second round runs after the replica and
+    TPC checks have dropped a big test, when running the cheap rest starts to
+    pay. Commits that break an import are still checked, except for the
+    tests that import the broken module.
+
+`PYTHONHASHSEED=0` keeps the TPC fingerprints deterministic.
+
 Any error inside these checks falls back to the static selection.
 A deadline (110 s) and a budget keep the batch well inside the 3-minute limit.
 

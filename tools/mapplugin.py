@@ -198,6 +198,10 @@ def pytest_runtest_call(item):
     _cur_test = item.nodeid
     _switch("r|" + item.nodeid)
     yield
+    _fx_leave()
+    if _fx["test"] == item.nodeid and _fx["times"]:
+        _fx_times[item.nodeid] = {str(k): round(v * 1000, 2) for k, v in _fx["times"].items()}
+        _fx_times[item.nodeid]["n"] = _fx["k"]
     _cur_test = None
 
 
@@ -252,7 +256,100 @@ def _exec_phase(fn):
     return wrapper
 
 
+# ------------------------------------------------ per-fixture-entry contexts
+# Tests that loop over SQL fixture files (check_file in test_optimizer, identity
+# loops) get one context per entry, f|<test>|<k>, k counting every entry the
+# fixture loaders yield during the test. check_file defers the comparison to a
+# subTest titled after the entry: that phase is mapped back to k by title.
+_fx = {"test": None, "k": 0, "titles": {}, "times": {}, "t0": 0.0, "cur": None}
+_fx_times: dict = {}
+
+
+def _fx_enter(k):
+    import time
+
+    _fx_leave()
+    _switch(f"f|{_fx['test']}|{k}")
+    _clear_caches()
+    _fx["cur"], _fx["t0"] = k, time.process_time()
+
+
+def _fx_leave():
+    import time
+
+    if _fx["cur"] is not None:
+        t = _fx["times"]
+        t[_fx["cur"]] = t.get(_fx["cur"], 0.0) + time.process_time() - _fx["t0"]
+        _fx["cur"] = None
+        _switch(f"r|{_fx['test']}")
+
+
+def _fx_loader(orig, pairs):
+    def loader(filename):
+        if _cur_test is None or not _ctx.startswith(("r|", "f|")):
+            yield from orig(filename)  # class setup / import: not split
+            return
+        if _fx["test"] != _cur_test:
+            _fx.update(test=_cur_test, k=0, titles={}, times={}, cur=None)
+        for i, item in enumerate(orig(filename), start=1):
+            k = _fx["k"]
+            _fx["k"] += 1
+            if pairs:
+                meta, sql, _ = item
+                title = meta.get("title") or f"{i}, {sql}"
+                _fx["titles"][title] = k if title not in _fx["titles"] else None  # ambiguous: outside
+            _fx_enter(k)
+            yield item
+        _fx_leave()
+
+    loader._fxwrapped = True
+    return loader
+
+
+def _install_fx():
+    import contextlib
+    import unittest
+
+    helpers = sys.modules.get("tests.helpers")
+    if helpers is None:
+        return
+    pairs_orig, single_orig = helpers.load_sql_fixture_pairs, helpers.load_sql_fixtures
+    if getattr(pairs_orig, "_fxwrapped", False):
+        return
+    pairs_w, single_w = _fx_loader(pairs_orig, True), _fx_loader(single_orig, False)
+    for name, m in list(sys.modules.items()):
+        if not name.startswith("tests") or m is None:
+            continue
+        if getattr(m, "load_sql_fixture_pairs", None) is pairs_orig:
+            m.load_sql_fixture_pairs = pairs_w
+        if getattr(m, "load_sql_fixtures", None) is single_orig:
+            m.load_sql_fixtures = single_w
+
+    orig_sub = unittest.TestCase.subTest
+    sentinel = unittest.case._subtest_msg_sentinel
+
+    @contextlib.contextmanager
+    def subTest(self, msg=sentinel, **params):
+        k = None
+        if isinstance(msg, str) and _fx["test"] == _cur_test and _cur_test is not None and _fx["cur"] is None:
+            title = msg[len("(execute) "):] if msg.startswith("(execute) ") else msg
+            k = _fx["titles"].get(title)
+        if k is None:
+            with orig_sub(self, msg, **params):
+                yield
+            return
+        _fx_enter(k)
+        try:
+            with orig_sub(self, msg, **params):
+                yield
+        finally:
+            _fx_leave()
+
+    unittest.TestCase.subTest = subTest
+
+
 def pytest_collection_modifyitems(session, config, items):
+    _install_fx()
     mod = sys.modules.get("tests.test_executor")
     if mod is not None and hasattr(mod, "TestExecutor"):
         mod.TestExecutor._mp_execute = _per_query_mp_execute
@@ -276,6 +373,8 @@ def pytest_unconfigure(config):
         json.dump({k: sorted(v) for k, v in _opens.items()}, f)
     with open(os.path.join(OUT, f"qtimes.{os.getpid()}.json"), "w") as f:
         json.dump(_query_times, f)
+    with open(os.path.join(OUT, f"fxtimes.{os.getpid()}.json"), "w") as f:
+        json.dump(_fx_times, f)
     classes = {}
     for ctx, types in _used.items():
         names = set()

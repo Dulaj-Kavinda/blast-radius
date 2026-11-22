@@ -41,7 +41,7 @@ def main() -> None:
         kind, _, node = ctx.partition("|")
         if kind == "c":
             return by_module.get(node, 0)
-        if kind in ("q", "x"):
+        if kind in ("q", "x", "f"):
             base = node.rsplit("|", 1)[0]
             return 1 << index[base] if base in index else 0
         if node not in index:
@@ -64,6 +64,9 @@ def main() -> None:
     shared_outside: dict = defaultdict(set)
     sub_exec: dict = defaultdict(lambda: defaultdict(set))
     own_outside: dict = defaultdict(lambda: defaultdict(set))
+    fx_lines: dict = defaultdict(lambda: defaultdict(dict))  # test -> file -> line -> entry bitmask
+    cls_lines: dict = defaultdict(lambda: defaultdict(set))  # file::Class -> lines run in setup / teardown
+    mod_lines: dict = defaultdict(lambda: defaultdict(set))  # test module -> lines run importing it
 
     files_mask: dict[str, int] = {}
     line_maps: dict[str, dict[int, int]] = {}
@@ -88,6 +91,13 @@ def main() -> None:
                     shared_outside[rel].add(lineno)  # module import
                 elif kind == "r":
                     own_outside[node][rel].add(lineno)  # a split test's own non-query code
+                if kind == "f":
+                    base, k = node.rsplit("|", 1)
+                    fx_lines[base][rel][lineno] = fx_lines[base][rel].get(lineno, 0) | (1 << int(k))
+                elif kind in ("s", "t"):
+                    cls_lines["::".join(node.split("::")[:2])][rel].add(lineno)
+                elif kind == "c":
+                    mod_lines[node][rel].add(lineno)
             if mask:
                 per_line[lineno] = mask
         if per_line:
@@ -146,6 +156,31 @@ def main() -> None:
         for base in sub_count
     }
     (out / "subunits.json").write_text(json.dumps(subunits, separators=(",", ":")))
+
+    # per-fixture-entry units (tests looping over SQL fixture files)
+    fxtimes = {}
+    for p in raw.glob("fxtimes.*.json"):
+        fxtimes.update(json.loads(p.read_text()))
+    fxunits = {}
+    for base, per_file in fx_lines.items():
+        if base not in index or base not in fxtimes:
+            continue
+        n = fxtimes[base]["n"]
+        outside = defaultdict(set)
+        for src in (
+            own_outside.get(base, {}),
+            cls_lines.get("::".join(base.split("::")[:2]), {}),
+            mod_lines.get(base.split("::")[0], {}),
+        ):
+            for rel, lines in src.items():
+                outside[rel] |= lines
+        fxunits[base] = {
+            "items": n,
+            "ms": [fxtimes[base].get(str(k), 0.0) for k in range(n)],
+            "lines": {f: {str(k): format(v, "x") for k, v in sorted(m.items())} for f, m in per_file.items()},
+            "outside": {f: sorted(v) for f, v in outside.items()},
+        }
+    (out / "fxunits.json").write_text(json.dumps(fxunits, separators=(",", ":")))
     (out / "files.json").write_text(json.dumps({k: format(v, "x") for k, v in sorted(files_mask.items())}))
     (out / "opens.json").write_text(json.dumps({k: format(v, "x") for k, v in sorted(opens.items())}))
     lines_dir = out / "lines"
